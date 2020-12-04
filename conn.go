@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
@@ -786,7 +787,7 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 
 func (c *Conn) advanceFrame() (int, error) {
 	// 1. Skip remainder of previous frame.
-
+	fmt.Println("advanceFrame 1")
 	if c.readRemaining > 0 {
 		if _, err := io.CopyN(ioutil.Discard, c.br, c.readRemaining); err != nil {
 			return noFrame, err
@@ -795,25 +796,32 @@ func (c *Conn) advanceFrame() (int, error) {
 
 	// 2. Read and parse first two bytes of frame header.
 
+	fmt.Println("advanceFrame 2")
 	p, err := c.read(2)
 	if err != nil {
 		return noFrame, err
 	}
+	fmt.Println("advanceFrame 3")
 
 	final := p[0]&finalBit != 0
 	frameType := int(p[0] & 0xf)
 	mask := p[1]&maskBit != 0
 	c.setReadRemaining(int64(p[1] & 0x7f))
 
+	fmt.Println("advanceFrame 4")
+
 	c.readDecompress = false
 	if c.newDecompressionReader != nil && (p[0]&rsv1Bit) != 0 {
 		c.readDecompress = true
 		p[0] &^= rsv1Bit
 	}
+	fmt.Println("advanceFrame 5")
 
 	if rsv := p[0] & (rsv1Bit | rsv2Bit | rsv3Bit); rsv != 0 {
 		return noFrame, c.handleProtocolError("unexpected reserved bits 0x" + strconv.FormatInt(int64(rsv), 16))
 	}
+
+	fmt.Println("advanceFrame 6")
 
 	switch frameType {
 	case CloseMessage, PingMessage, PongMessage:
@@ -836,6 +844,8 @@ func (c *Conn) advanceFrame() (int, error) {
 	default:
 		return noFrame, c.handleProtocolError("unknown opcode " + strconv.Itoa(frameType))
 	}
+
+	fmt.Println("advanceFrame 7")
 
 	// 3. Read and parse frame length as per
 	// https://tools.ietf.org/html/rfc6455#section-5.2
@@ -869,6 +879,7 @@ func (c *Conn) advanceFrame() (int, error) {
 			return noFrame, err
 		}
 	}
+	fmt.Println("advanceFrame 8")
 
 	// 4. Handle frame masking.
 
@@ -876,6 +887,7 @@ func (c *Conn) advanceFrame() (int, error) {
 		return noFrame, c.handleProtocolError("incorrect mask flag")
 	}
 
+	fmt.Println("advanceFrame 9")
 	if mask {
 		c.readMaskPos = 0
 		p, err := c.read(len(c.readMaskKey))
@@ -884,6 +896,7 @@ func (c *Conn) advanceFrame() (int, error) {
 		}
 		copy(c.readMaskKey[:], p)
 	}
+	fmt.Println("advanceFrame 10")
 
 	// 5. For text and binary messages, enforce read limit and return.
 
@@ -903,6 +916,7 @@ func (c *Conn) advanceFrame() (int, error) {
 
 		return frameType, nil
 	}
+	fmt.Println("advanceFrame 11")
 
 	// 6. Read control frame payload.
 
@@ -917,6 +931,7 @@ func (c *Conn) advanceFrame() (int, error) {
 			maskBytes(c.readMaskKey, 0, payload)
 		}
 	}
+	fmt.Println("advanceFrame 12")
 
 	// 7. Process control frame payload.
 
@@ -947,6 +962,7 @@ func (c *Conn) advanceFrame() (int, error) {
 		}
 		return noFrame, &CloseError{Code: closeCode, Text: closeText}
 	}
+	fmt.Println("advanceFrame 13")
 
 	return frameType, nil
 }
@@ -968,20 +984,24 @@ func (c *Conn) handleProtocolError(message string) error {
 // this method return the same error.
 func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 	// Close previous reader, only relevant for decompression.
+	fmt.Println("WebSocket.conn.go NextReader1")
 	if c.reader != nil {
 		c.reader.Close()
 		c.reader = nil
 	}
 
+	fmt.Println("WebSocket.conn.go NextReader2")
 	c.messageReader = nil
 	c.readLength = 0
 
 	for c.readErr == nil {
+		fmt.Println("WebSocket.conn.go NextReader3")
 		frameType, err := c.advanceFrame()
 		if err != nil {
 			c.readErr = hideTempErr(err)
 			break
 		}
+		fmt.Println("WebSocket.conn.go NextReader4")
 
 		if frameType == TextMessage || frameType == BinaryMessage {
 			c.messageReader = &messageReader{c}
@@ -989,10 +1009,12 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 			if c.readDecompress {
 				c.reader = c.newDecompressionReader(c.reader)
 			}
+			fmt.Println("WebSocket.conn.go NextReader5")
 			return frameType, c.reader, nil
 		}
 	}
 
+	fmt.Println("WebSocket.conn.go NextReader6")
 	// Applications that do handle the error returned from this method spin in
 	// tight loop on connection failure. To help application developers detect
 	// this error, panic on repeated reads to the failed connection.
@@ -1000,6 +1022,7 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 	if c.readErrCount >= 1000 {
 		panic("repeated read on failed websocket connection")
 	}
+	fmt.Println("WebSocket.conn.go NextReader7")
 
 	return noFrame, nil, c.readErr
 }
