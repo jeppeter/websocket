@@ -261,11 +261,12 @@ type Conn struct {
 	newCompressionWriter   func(io.WriteCloser, int) io.WriteCloser
 
 	// Read fields
-	reader  io.ReadCloser // the current reader returned to the application
-	readErr error
-	br      *bufio.Reader
-	rbuf    []byte
-	rlen    int
+	reader    io.ReadCloser // the current reader returned to the application
+	readErr   error
+	br        *bufio.Reader
+	rbuf      []byte
+	rlen      int
+	rdeadline time.Time
 	// bytes remaining in current frame.
 	// set setReadRemaining to safely update this value and prevent overflow
 	readRemaining int64
@@ -318,6 +319,9 @@ func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, 
 		writeBufSize:           writeBufferSize,
 		enableWriteCompression: true,
 		compressionLevel:       defaultCompressionLevel,
+		rbuf:                   []byte{},
+		rlen:                   0,
+		rdeadline:              time.Now().Add(time.Duration(60) * time.Second),
 	}
 	c.SetCloseHandler(nil)
 	c.SetPingHandler(nil)
@@ -367,6 +371,49 @@ func (c *Conn) writeFatal(err error) error {
 	}
 	c.writeErrMu.Unlock()
 	return err
+}
+
+func (c *Conn) readtimeout(n int) ([]byte, error) {
+	var retbyte []byte
+	var i int
+	var leftn int
+	var rb []byte
+	var rcnt int
+	var err error
+	if (c.rlen + n) < len(c.rbuf) {
+		retbyte = make([]byte, n)
+		for i = 0; i < n; i++ {
+			retbyte[i] = c.rbuf[c.rlen+i]
+		}
+		c.rlen += n
+		return retbyte, nil
+	}
+	/*this time should read*/
+	leftn = n
+	if (c.rlen) < len(c.rbuf) {
+		leftn = len(c.rbuf) - c.rlen
+	}
+
+	rb = make([]byte, leftn)
+
+	for leftn > 0 {
+		rcnt, err = c.conn.Read(rb[:leftn])
+		if err != nil {
+			return []byte{}, err
+		}
+
+		for i = 0; i < rcnt; i++ {
+			c.rbuf = append(c.rbuf, rb[i])
+		}
+		leftn -= rcnt
+	}
+
+	retbyte = make([]byte, n)
+	for i = 0; i < n; i++ {
+		retbyte[i] = c.rbuf[c.rlen+i]
+	}
+	c.rlen += n
+	return retbyte, nil
 }
 
 func (c *Conn) read(n int) ([]byte, error) {
@@ -787,6 +834,215 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 
 // Read methods
 
+func (c *Conn) advanceFrameTimeout(mills int) (int, error) {
+	var nowt time.Time
+	var nextt time.Time
+	// 1. Skip remainder of previous frame.
+	if c.readRemaining > 0 {
+		if _, err := io.CopyN(ioutil.Discard, c.br, c.readRemaining); err != nil {
+			fmt.Println("advanceFrameTimeout err1", err)
+			return noFrame, err
+		}
+	}
+
+	/*to make read from one packet frame at begin*/
+	c.rlen = 0
+
+	nowt = time.Now()
+	nextt = nowt.Add(time.Duration(mills) * time.Millisecond)
+
+	c.conn.SetReadDeadline(nextt)
+
+	/*we recovery the deadline*/
+	defer c.conn.SetReadDeadline(c.rdeadline)
+
+	// 2. Read and parse first two bytes of frame header.
+
+	p, err := c.readtimeout(2)
+	if err != nil {
+		fmt.Println("advanceFrameTimeout err2", err)
+		return noFrame, err
+	}
+
+	final := p[0]&finalBit != 0
+	frameType := int(p[0] & 0xf)
+	mask := p[1]&maskBit != 0
+	c.setReadRemaining(int64(p[1] & 0x7f))
+
+	c.readDecompress = false
+	if c.newDecompressionReader != nil && (p[0]&rsv1Bit) != 0 {
+		c.readDecompress = true
+		p[0] &^= rsv1Bit
+	}
+
+	if rsv := p[0] & (rsv1Bit | rsv2Bit | rsv3Bit); rsv != 0 {
+		fmt.Println("advanceFrameTimeout err3")
+		return noFrame, c.handleProtocolError("unexpected reserved bits 0x" + strconv.FormatInt(int64(rsv), 16))
+	}
+
+	switch frameType {
+	case CloseMessage, PingMessage, PongMessage:
+		if c.readRemaining > maxControlFramePayloadSize {
+			fmt.Println("advanceFrameTimeout err4")
+			return noFrame, c.handleProtocolError("control frame length > 125")
+		}
+		if !final {
+			fmt.Println("advanceFrameTimeout err5")
+			return noFrame, c.handleProtocolError("control frame not final")
+		}
+	case TextMessage, BinaryMessage:
+		if !c.readFinal {
+			fmt.Println("advanceFrameTimeout err6")
+			return noFrame, c.handleProtocolError("message start before final message frame")
+		}
+		c.readFinal = final
+	case continuationFrame:
+		if c.readFinal {
+			fmt.Println("advanceFrameTimeout err7")
+			return noFrame, c.handleProtocolError("continuation after final message frame")
+		}
+		c.readFinal = final
+	default:
+		fmt.Println("advanceFrameTimeout err8")
+		return noFrame, c.handleProtocolError("unknown opcode " + strconv.Itoa(frameType))
+	}
+
+	// 3. Read and parse frame length as per
+	// https://tools.ietf.org/html/rfc6455#section-5.2
+	//
+	// The length of the "Payload data", in bytes: if 0-125, that is the payload
+	// length.
+	// - If 126, the following 2 bytes interpreted as a 16-bit unsigned
+	// integer are the payload length.
+	// - If 127, the following 8 bytes interpreted as
+	// a 64-bit unsigned integer (the most significant bit MUST be 0) are the
+	// payload length. Multibyte length quantities are expressed in network byte
+	// order.
+
+	switch c.readRemaining {
+	case 126:
+		p, err := c.readtimeout(2)
+		if err != nil {
+			fmt.Println("advanceFrameTimeout err9")
+			return noFrame, err
+		}
+
+		if err := c.setReadRemaining(int64(binary.BigEndian.Uint16(p))); err != nil {
+			fmt.Println("advanceFrameTimeout err10")
+			return noFrame, err
+		}
+	case 127:
+		p, err := c.readtimeout(8)
+		if err != nil {
+			fmt.Println("advanceFrameTimeout err11")
+			return noFrame, err
+		}
+
+		if err := c.setReadRemaining(int64(binary.BigEndian.Uint64(p))); err != nil {
+			fmt.Println("advanceFrameTimeout err12")
+			return noFrame, err
+		}
+	}
+
+	// 4. Handle frame masking.
+
+	if mask != c.isServer {
+		fmt.Println("advanceFrameTimeout err13")
+		return noFrame, c.handleProtocolError("incorrect mask flag")
+	}
+
+	if mask {
+		c.readMaskPos = 0
+		p, err := c.readtimeout(len(c.readMaskKey))
+		if err != nil {
+			fmt.Println("advanceFrameTimeout err14")
+			return noFrame, err
+		}
+		copy(c.readMaskKey[:], p)
+	}
+
+	// 5. For text and binary messages, enforce read limit and return.
+
+	if frameType == continuationFrame || frameType == TextMessage || frameType == BinaryMessage {
+
+		c.readLength += c.readRemaining
+		// Don't allow readLength to overflow in the presence of a large readRemaining
+		// counter.
+		if c.readLength < 0 {
+			fmt.Println("advanceFrameTimeout err15")
+			return noFrame, ErrReadLimit
+		}
+
+		if c.readLimit > 0 && c.readLength > c.readLimit {
+			c.WriteControl(CloseMessage, FormatCloseMessage(CloseMessageTooBig, ""), time.Now().Add(writeWait))
+			fmt.Println("advanceFrameTimeout err16")
+			return noFrame, ErrReadLimit
+		}
+
+		/*to clear the not handle read buffer*/
+		c.rbuf = []byte{}
+		c.rlen = 0
+		return frameType, nil
+	}
+
+	// 6. Read control frame payload.
+
+	var payload []byte
+	if c.readRemaining > 0 {
+		payload, err = c.readtimeout(int(c.readRemaining))
+		c.setReadRemaining(0)
+		if err != nil {
+			fmt.Println("advanceFrameTimeout err17")
+			return noFrame, err
+		}
+		if c.isServer {
+			maskBytes(c.readMaskKey, 0, payload)
+		}
+	}
+
+	// 7. Process control frame payload.
+
+	switch frameType {
+	case PongMessage:
+		if err := c.handlePong(string(payload)); err != nil {
+			fmt.Println("advanceFrameTimeout err18")
+			return noFrame, err
+		}
+	case PingMessage:
+		if err := c.handlePing(string(payload)); err != nil {
+			fmt.Println("advanceFrameTimeout err19")
+			return noFrame, err
+		}
+	case CloseMessage:
+		closeCode := CloseNoStatusReceived
+		closeText := ""
+		if len(payload) >= 2 {
+			closeCode = int(binary.BigEndian.Uint16(payload))
+			if !isValidReceivedCloseCode(closeCode) {
+				fmt.Println("advanceFrameTimeout err20")
+				return noFrame, c.handleProtocolError("invalid close code")
+			}
+			closeText = string(payload[2:])
+			if !utf8.ValidString(closeText) {
+				fmt.Println("advanceFrameTimeout err21")
+				return noFrame, c.handleProtocolError("invalid utf8 payload in close frame")
+			}
+		}
+		if err := c.handleClose(closeCode, closeText); err != nil {
+			fmt.Println("advanceFrameTimeout err22")
+			return noFrame, err
+		}
+		fmt.Println("advanceFrameTimeout err23")
+		return noFrame, &CloseError{Code: closeCode, Text: closeText}
+	}
+
+	/*to clear the not handled timeout ,so do this*/
+	c.rbuf = []byte{}
+	c.rlen = 0
+
+	return frameType, nil
+}
+
 func (c *Conn) advanceFrame() (int, error) {
 	// 1. Skip remainder of previous frame.
 	fmt.Println("advanceFrame 1")
@@ -975,7 +1231,46 @@ func (c *Conn) handleProtocolError(message string) error {
 }
 
 func (c *Conn) NextReaderTimeout(mills int) (messageType int, r io.Reader, err error) {
-	return noFrame, c.reader, nil
+	var neterr net.Error
+	var ok bool
+	// Close previous reader, only relevant for decompression.
+	if c.reader != nil {
+		c.reader.Close()
+		c.reader = nil
+	}
+
+	c.messageReader = nil
+	c.readLength = 0
+
+	for c.readErr == nil {
+		frameType, err := c.advanceFrameTimeout(mills)
+		if err != nil {
+			c.readErr = err
+			break
+		}
+
+		if frameType == TextMessage || frameType == BinaryMessage {
+			c.messageReader = &messageReader{c}
+			c.reader = c.messageReader
+			if c.readDecompress {
+				c.reader = c.newDecompressionReader(c.reader)
+			}
+			return frameType, c.reader, nil
+		}
+	}
+
+	neterr, ok = c.readErr.(net.Error)
+
+	// Applications that do handle the error returned from this method spin in
+	// tight loop on connection failure. To help application developers detect
+	// this error, panic on repeated reads to the failed connection.
+	if !ok || !neterr.Timeout() {
+		c.readErrCount++
+		if c.readErrCount >= 1000 {
+			panic("repeated read on failed websocket connection")
+		}
+	}
+	return noFrame, nil, c.readErr
 }
 
 // NextReader returns the next data message received from the peer. The
@@ -1103,6 +1398,7 @@ func (c *Conn) ReadMessage() (messageType int, p []byte, err error) {
 // all future reads will return an error. A zero value for t means reads will
 // not time out.
 func (c *Conn) SetReadDeadline(t time.Time) error {
+	c.rdeadline = t
 	return c.conn.SetReadDeadline(t)
 }
 
