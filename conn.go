@@ -264,6 +264,8 @@ type Conn struct {
 	reader  io.ReadCloser // the current reader returned to the application
 	readErr error
 	br      *bufio.Reader
+	rbuf    []byte
+	rlen    int
 	// bytes remaining in current frame.
 	// set setReadRemaining to safely update this value and prevent overflow
 	readRemaining int64
@@ -970,6 +972,10 @@ func (c *Conn) advanceFrame() (int, error) {
 func (c *Conn) handleProtocolError(message string) error {
 	c.WriteControl(CloseMessage, FormatCloseMessage(CloseProtocolError, message), time.Now().Add(writeWait))
 	return errors.New("websocket: " + message)
+}
+
+func (c *Conn) NextReaderTimeout(mills int) (messageType int, r io.Reader, err error) {
+	return noFrame, c.reader, nil
 }
 
 // NextReader returns the next data message received from the peer. The
