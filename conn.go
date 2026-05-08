@@ -1044,6 +1044,11 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 	return noFrame, nil, c.readErr
 }
 
+func (c *Conn) ResetReadErr() {
+	c.readErr = nil
+	c.readErrCount = 0
+}
+
 type messageReader struct{ c *Conn }
 
 func (r *messageReader) Read(b []byte) (int, error) {
